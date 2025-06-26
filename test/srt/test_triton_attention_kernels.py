@@ -282,7 +282,9 @@ class TestTritonAttention(CustomTestCase):
         # Test configurations
         configs = [
             (2, 4, 4, 64),  # MHA
+            (128, 4, 4, 64),  # MHA
             (2, 4, 2, 64),  # GQA
+            (128, 4, 2, 64),  # GQA
             (2, 4, 4, 80),  # Non-standard head dim
             (2, 4, 4, 13),  # Prime number head dim
         ]

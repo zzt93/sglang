@@ -510,6 +510,7 @@ class CudaGraphRunner:
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_paths=lora_paths,
+            capturing_cuda_graph=True,
         )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 

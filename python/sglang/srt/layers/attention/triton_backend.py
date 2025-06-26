@@ -36,6 +36,8 @@ class ForwardMetadata:
     window_kv_indices: torch.Tensor
     window_num_kv_splits: torch.Tensor
 
+    dynamic_max_kv_splits: int = 0
+
 
 class TritonAttnBackend(AttentionBackend):
     def __init__(
@@ -125,6 +127,7 @@ class TritonAttnBackend(AttentionBackend):
         self,
         num_kv_splits: torch.Tensor,
         seq_lens: torch.Tensor,
+        capturing_cuda_graph: bool = True,
     ):
         num_token, num_seq = num_kv_splits.shape[0], seq_lens.shape[0]
         # NOTE(alcanderian): Considering speculative_decodeing,
@@ -145,6 +148,16 @@ class TritonAttnBackend(AttentionBackend):
         else:
             SCHEDULE_SEQ = triton.next_power_of_2(num_seq)
 
+        # import logging
+        # logger = logging.getLogger(__name__)
+        # logger.info(f"seq_lens=({seq_lens})"
+        #             f"num_group={num_group}, "
+        #             f"num_seq={num_seq}, "
+        #             f"self.num_head={self.num_head}, "
+        #             f"self.num_kv_head={self.num_kv_head}, "
+        #             f"self.max_kv_splits={self.max_kv_splits}, "
+        #             f"self.device_core_count={self.device_core_count}, "
+        #             f"SCHEDULE_SEQ={SCHEDULE_SEQ}")
         get_num_kv_splits_triton[(1,)](
             num_kv_splits,
             seq_lens,
@@ -152,7 +165,7 @@ class TritonAttnBackend(AttentionBackend):
             num_group,
             self.num_head,
             self.num_kv_head,
-            self.max_kv_splits,
+            self.max_kv_splits if capturing_cuda_graph else self.max_kv_splits * 8,
             self.device_core_count,
             MAX_NUM_SEQ=SCHEDULE_SEQ,
         )
@@ -165,6 +178,7 @@ class TritonAttnBackend(AttentionBackend):
         window_kv_indptr = self.window_kv_indptr
         window_kv_indices = None
         window_num_kv_splits = None
+        dynamic_max_kv_splits = 0
         spec_info = forward_batch.spec_info
 
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -203,22 +217,31 @@ class TritonAttnBackend(AttentionBackend):
                         (bs,), dtype=torch.int32, device=self.device
                     )
                     self.get_num_kv_splits(window_num_kv_splits, window_kv_lens)
+                    # dynamic_max_kv_splits = torch.max(window_num_kv_splits)
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 bs = kv_indptr.shape[0] - 1
 
+            num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
+            self.get_num_kv_splits(
+                num_kv_splits,
+                forward_batch.seq_lens,
+                forward_batch.capturing_cuda_graph,
+            )
+            split_dim = self.max_kv_splits
+            if not forward_batch.capturing_cuda_graph:
+                dynamic_max_kv_splits = torch.max(num_kv_splits).item()
+                split_dim = dynamic_max_kv_splits
             attn_logits = torch.empty(
-                (bs, self.num_head, self.max_kv_splits, self.v_head_dim),
+                (bs, self.num_head, split_dim, self.v_head_dim),
                 dtype=torch.float32,
                 device=self.device,
             )
             attn_lse = torch.empty(
-                (bs, self.num_head, self.max_kv_splits),
+                (bs, self.num_head, split_dim),
                 dtype=torch.float32,
                 device=self.device,
             )
-            num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
-            self.get_num_kv_splits(num_kv_splits, forward_batch.seq_lens)
 
             qo_indptr = None
             custom_mask = None
@@ -332,6 +355,7 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_indptr,
             window_kv_indices,
             window_num_kv_splits,
+            dynamic_max_kv_splits=dynamic_max_kv_splits,
         )
 
     def init_cuda_graph_state(
@@ -717,7 +741,11 @@ class TritonAttnBackend(AttentionBackend):
             self.forward_metadata.attn_logits,
             self.forward_metadata.attn_lse,
             self.forward_metadata.num_kv_splits,
-            self.max_kv_splits,
+            (
+                self.max_kv_splits
+                if forward_batch.capturing_cuda_graph
+                else self.forward_metadata.dynamic_max_kv_splits
+            ),
             layer.scaling,
             layer.logit_cap,
         )
@@ -875,6 +903,7 @@ def get_num_kv_splits_triton(
     max_kv_splits,
     device_core_count,
     MAX_NUM_SEQ: tl.constexpr,
+    query_len=1,
 ):
     # TODO: this method is tunable, we need more online serving data to tune it
     offs_seq = tl.arange(0, MAX_NUM_SEQ)
@@ -882,17 +911,17 @@ def get_num_kv_splits_triton(
 
     seq_lens = tl.load(seq_lens_ptr + offs_seq, mask=mask_seq, other=0)
     max_seq_len = tl.max(seq_lens)
-    seq_lens = tl.load(seq_lens_ptr + offs_seq, mask=mask_seq, other=max_seq_len)
-    min_seq_len = tl.min(seq_lens)
-    if max_seq_len * 8 < min_seq_len * 10:
-        min_seq_len = max_seq_len
-    max_kv_splits_1 = tl.minimum(tl.cdiv(max_seq_len, min_seq_len), max_kv_splits)
-    kv_chunk_size_1 = tl.cdiv(max_seq_len, max_kv_splits_1)
+    # seq_lens = tl.load(seq_lens_ptr + offs_seq, mask=mask_seq, other=max_seq_len)
+    # min_seq_len = tl.min(seq_lens)
+    # if max_seq_len * 8 < min_seq_len * 10:
+    #     min_seq_len = max_seq_len
+    # max_kv_splits_1 = tl.minimum(tl.cdiv(max_seq_len, min_seq_len), max_kv_splits)
+    # kv_chunk_size_1 = tl.cdiv(max_seq_len, max_kv_splits_1)
 
     # NOTE: this is a hack to let num_kv_split grows up with seqlen gradually
     ext_seq_len = tl.cast(max_seq_len, tl.float32) / 64.0
     ext_device_core_count = tl.cast(
-        device_core_count * tl.maximum(tl.log2(ext_seq_len), 1.0), tl.int32
+        device_core_count * tl.maximum(tl.log2(ext_seq_len), 1.0) * 16, tl.int32
     )
     block_h, num_kv_group = 16, num_head // num_kv_head
     if num_kv_group == 1:
@@ -906,9 +935,7 @@ def get_num_kv_splits_triton(
     )
     kv_chunk_size_2 = tl.cdiv(max_seq_len, max_kv_splits_2)
 
-    num_kv_splits = tl.maximum(
-        tl.cdiv(seq_lens, kv_chunk_size_1), tl.cdiv(seq_lens, kv_chunk_size_2)
-    )
+    num_kv_splits = tl.cdiv(seq_lens, kv_chunk_size_2)
 
     offs_token = offs_seq * num_group
     mask_token = offs_token < num_seq * num_group

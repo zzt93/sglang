@@ -401,6 +401,11 @@ def _fwd_grouped_kernel_stage1(
         )
 
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
 def _decode_grouped_att_m_fwd(
     q,
     k_buffer,
@@ -413,6 +418,7 @@ def _decode_grouped_att_m_fwd(
     max_kv_splits,
     sm_scale,
     logit_cap,
+    capturing_cuda_graph=False,
 ):
     BLOCK = 32
     Lk = k_buffer.shape[-1]
@@ -435,9 +441,11 @@ def _decode_grouped_att_m_fwd(
 
     batch, head_num = kv_indptr.shape[0] - 1, q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[1]
-
     BLOCK_H = 16
     MAX_KV_SPLITS = max_kv_splits
+    # logger.info(f"MAX_KV_SPLITS: {MAX_KV_SPLITS}"
+    #             f"batch: {batch}, head_num: {head_num}"
+    #             )
     grid = (
         batch,
         triton.cdiv(head_num, min(BLOCK_H, kv_group_num)),
@@ -609,6 +617,7 @@ def decode_attention_fwd_normal(
     max_kv_splits,
     sm_scale,
     logit_cap=0.0,
+    capturing_cuda_graph=False,
 ):
     _decode_att_m_fwd(
         q,
@@ -648,6 +657,7 @@ def decode_attention_fwd_grouped(
     max_kv_splits,
     sm_scale,
     logit_cap=0.0,
+    capturing_cuda_graph=False,
 ):
     _decode_grouped_att_m_fwd(
         q,
@@ -661,6 +671,7 @@ def decode_attention_fwd_grouped(
         max_kv_splits,
         sm_scale,
         logit_cap,
+        capturing_cuda_graph=capturing_cuda_graph,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -687,6 +698,7 @@ def decode_attention_fwd(
     max_kv_splits,
     sm_scale,
     logit_cap=0.0,
+    capturing_cuda_graph=False,
 ):
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] <= kv_indptr.shape[0] - 1
@@ -709,6 +721,7 @@ def decode_attention_fwd(
             max_kv_splits,
             sm_scale,
             logit_cap=logit_cap,
+            capturing_cuda_graph=capturing_cuda_graph,
         )
     else:
         # GQA/MQA/MLA
@@ -725,4 +738,5 @@ def decode_attention_fwd(
             max_kv_splits,
             sm_scale,
             logit_cap=logit_cap,
+            capturing_cuda_graph=capturing_cuda_graph,
         )
