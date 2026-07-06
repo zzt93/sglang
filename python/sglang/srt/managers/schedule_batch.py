@@ -2110,6 +2110,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         req: Req,
     ) -> "_MambaRadixCacheV2TrackEntry":
+        # Skip mamba state tracking during middle chunks of chunked prefill.
+        # Eliminates per-chunk radix tree inserts, mamba slot allocations,
+        # and GPU state copies. The full prefix + final mamba state is inserted
+        # after the last chunk (when inflight_middle_chunks == 0).
+        if req.inflight_middle_chunks > 0:
+            return _MambaRadixCacheV2TrackEntry(
+                track_mask=False,
+                track_index=0,
+                track_seqlen=-1,
+            )
+
         mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
 
         def _force_track_h(i: int) -> int:
